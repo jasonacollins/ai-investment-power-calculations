@@ -1,0 +1,1848 @@
+---
+title: "Power Analysis: AI Investment Decision Experiment"
+subtitle: "Within-subjects design with 6 conditions"
+author:
+- "Jason Collins"
+- "Iñigo De Juan Razquin"
+- "Jianhua Li"
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-location: left
+    theme: flatly
+    code-fold: true
+    code-summary: "Show code"
+execute:
+  freeze: true
+  cache: true
+  cache.rebuild: false
+  warning: false
+  message: false
+---
+
+```{r chunk-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,    # hide code by default
+  warning = FALSE,    # suppress warnings
+  message = FALSE,    # suppress messages
+  fig.width  = 8,     # consistent figure width
+  fig.height = 5,     # consistent figure height
+  fig.align  = "center",
+  dpi        = 96     # reasonable resolution for html
+)
+
+```
+
+```{r setup}
+
+# Load required packages
+library(tidyverse)
+library(lme4)
+library(geepack)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(progress)
+library(parallel)
+library(pbapply)
+library(simr)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Control output verbosity
+show_diagnostics <- TRUE  # Set to TRUE for debugging
+
+# Global effect size parameter (percentage point increase)
+EFFECT_SIZE <- 0.03  # 3% increase: 75% → 78%
+
+# Significance levels
+ALPHA_STANDARD <- 0.05
+ALPHA_BONFERRONI <- 0.01 
+
+# Experimental design parameters
+N_ROUNDS <- 6  # 1 control + 5 treatments
+N_DECISIONS <- 6  # decisions per condition
+subject_sd <- 0.15  # Subject-level SD for random effects
+subj_cond_sd <- 0.05  # Subject-by-condition SD for random effects
+practice_effect <- 0.01 # (0.01 = 1% improvement per block)
+
+# Quick mode for testing (set to FALSE for full analysis)
+quick_mode <- TRUE
+
+# Start global timer
+global_start_time <- Sys.time()
+
+# Detect cores for parallel processing
+n_cores <- max(1, detectCores() - 1)  # Leave one core free
+
+# Check if parallel processing is available
+use_parallel <- n_cores > 1
+
+# Print settings
+# Print settings
+if(show_diagnostics) {
+  cat(sprintf("Running in %s mode\n", ifelse(quick_mode, "QUICK TEST", "FULL")))
+  cat(sprintf("Parallel processing: %s\n", ifelse(use_parallel, 
+              sprintf("Yes (%d cores)", n_cores), "No (single core)")))
+}
+
+# Set pbapply options
+if (!use_parallel) {
+  pboptions(type = "timer", char = "=")
+}
+```
+
+
+## Study Design Overview
+
+This document provides power analysis for a within-subjects experiment with the following characteristics:
+
+- **Design**: Within-subjects (repeated measures)
+- **Participants**: Each participant completes 6 rounds, which each round being a separate condition
+- **Conditions**: 1 control + 5 treatment conditions
+- **Measurements**: 6 binary decisions per round (36 total per participant)
+- **Outcome**: Score out of 6 for each round
+- **Hypothesis**: Treatments will show 3% improvement over control (75% → 78% correct)
+- **Target**: 90% power at α = 0.05
+- **Multiple comparisons**: Bonferroni correction for 5 comparisons (α = 0.01)
+- **Sample size range**: 100 to 620 participants
+
+## Power Analysis Methods
+
+We tested three approaches:
+
+1. **Paired t-test**: Compare participant scores out of 6 per condition
+2. **GLMM**: Mixed-effects logistic regression on individual responses  
+3. **GEE**: Generalised estimating equations with exchangeable correlation
+
+All methods use Bonferroni correction (α = 0.01) for 5 treatment comparisons.
+
+## Method 1: Paired t-test on Scores
+
+This method compares the mean scores of each treatment condition against the control condition using paired t-tests.
+
+**Assumptions**:
+
+- Scores are approximately normally distributed (reasonable with 6 decisions)
+
+```{r method1-functions}
+
+simulate_scores <- function(n_subjects,
+                            p_control = 0.75,
+                            effect_size = EFFECT_SIZE,
+                            n_decisions = 6,
+                            subject_sd = 0.15) {
+  # Generate all combinations of subjects and conditions
+  subjects  <- seq_len(n_subjects)
+  conditions <- c("control", paste0("treatment", 1:5))
+  df <- expand.grid(subject = subjects, condition = conditions, stringsAsFactors = FALSE)
+  
+  # Random subject effects
+  subj_effects <- rnorm(n_subjects, mean = 0, sd = subject_sd)
+  df$subject_effect <- subj_effects[df$subject]
+  
+  # Base success probability per row
+  df$base_prob <- ifelse(df$condition == "control",
+                         p_control,
+                         p_control + effect_size)
+  
+  # Add subject effect on logit scale
+  logit_p   <- qlogis(df$base_prob) + df$subject_effect
+  p_final   <- plogis(logit_p)
+  
+  # Simulate scores out of n_decisions in one call
+  df$score      <- rbinom(nrow(df), size = n_decisions, prob = p_final)
+  df$proportion <- df$score / n_decisions
+  
+  return(df)
+}
+
+# Analysis using paired t-test
+analyse_paired <- function(data, return_all_p = FALSE) {
+  # Prepare data - control vs each treatment separately
+  control_data <- data %>%
+    filter(condition == "control") %>%
+    select(subject, control_score = score)
+  
+  treatment_data <- data %>%
+    filter(condition != "control") %>%
+    left_join(control_data, by = "subject")
+  
+  # Perform 5 separate paired t-tests
+  p_values <- treatment_data %>%
+    group_by(condition) %>%
+    summarise(
+      p_value = {
+        if (n() > 1 && sd(score - control_score) > 0) {
+          t.test(score, control_score, paired = TRUE)$p.value
+        } else {
+          NA
+        }
+      },
+      .groups = 'drop'
+    ) %>%
+    pull(p_value)
+  
+  # Remove any NA values
+  p_values <- p_values[!is.na(p_values)]
+  
+  if (return_all_p) {
+    return(p_values)
+  } else {
+    # Return the minimum p-value (most significant comparison)
+    # This tests if AT LEAST ONE treatment beats control
+    return(ifelse(length(p_values) > 0, min(p_values), NA))
+  }
+}
+
+# Power calculation function (with fallback to non-parallel)
+calculate_power_paired_fast <- function(n_subjects, 
+                                      n_sims = 1000, 
+                                      alpha = 0.05,
+                                      effect_size = 0.05,
+                                      verbose = FALSE) {
+  
+  if (verbose && n_sims >= 100) {
+    pb <- progress_bar$new(
+      format = sprintf("  N=%d [:bar] :percent | :current/:total", n_subjects),
+      total = n_sims,
+      clear = FALSE,
+      width = 60
+    )
+  }
+  
+  # Track successes rather than p-values
+  successes <- 0
+  
+  for (i in 1:n_sims) {
+    data <- simulate_scores(n_subjects, effect_size = effect_size)
+    min_p <- analyse_paired(data, return_all_p = FALSE)
+    
+    # For Bonferroni with 5 comparisons:
+    # If alpha = 0.01, this is already the Bonferroni-corrected alpha (0.05/5)
+    # If alpha = 0.05, this is testing without correction
+    if (!is.na(min_p) && min_p < alpha) {
+      successes <- successes + 1
+    }
+    
+    if (verbose && n_sims >= 100 && i %% 10 == 0) {
+      pb$update(i/n_sims)
+    }
+  }
+  
+  if (verbose && n_sims >= 100) {
+    pb$terminate()
+  }
+  
+  # Calculate power
+  power <- successes / n_sims
+  
+  # Add diagnostic info for first calculation
+  if (n_subjects == 20 && alpha == 0.05 && !verbose) {
+    cat(sprintf("\nDiagnostic for N=20, alpha=0.05:\n"))
+    cat(sprintf("  Power (at least one significant): %.3f\n", power))
+  }
+  
+  return(power)
+}
+
+# Parallelised power calculation with progress
+calculate_power_paired_parallel <- function(n_subjects, 
+                                          n_sims = 1000, 
+                                          alpha = 0.05,
+                                          effect_size = 0.05,
+                                          show_progress = TRUE) {
+  
+  # Set up cluster
+  cl <- parallel::makeCluster(n_cores)
+  on.exit(parallel::stopCluster(cl))  # Ensure cluster is always closed
+  
+  # Export all required functions and variables
+  parallel::clusterExport(cl, c("simulate_scores", "analyse_paired", "n_subjects", "effect_size"), 
+                  envir = environment())
+  
+  # Load required packages on all workers
+  parallel::clusterEvalQ(cl, {
+    library(tidyverse)
+    library(stats)  # For rbinom, rnorm, t.test
+  })
+  
+  # Function to run on workers
+  sim_function <- function(i, n_subj, eff_size, alph) {
+    tryCatch({
+      data <- simulate_scores(n_subj, effect_size = eff_size)
+      min_p <- analyse_paired(data, return_all_p = FALSE)
+      # Return 1 if significant, 0 otherwise
+      ifelse(!is.na(min_p) && min_p < alph, 1, 0)
+    }, error = function(e) 0)
+  }
+  
+  # Run simulations in parallel
+  parallel::clusterExport(cl, c("sim_function", "alpha"), envir = environment())
+  
+  if (show_progress && n_sims > 100) {
+    successes <- pbsapply(1:n_sims, sim_function, 
+                         n_subj = n_subjects, 
+                         eff_size = effect_size,
+                         alph = alpha,
+                         cl = cl)
+  } else {
+    successes <- parallel::parSapply(cl, 1:n_sims, sim_function,
+                          n_subj = n_subjects, 
+                          eff_size = effect_size,
+                          alph = alpha)
+  }
+  
+  # Calculate power
+  power <- mean(successes)
+  return(power)
+}
+
+# Diagnostic function to check all 5 p-values
+check_multiple_comparisons <- function(n_subjects = 100, effect_size = 0.05) {
+  
+  # Generate one dataset
+  data <- simulate_scores(n_subjects, effect_size = effect_size)
+  
+  # Get all p-values
+  all_p_values <- analyse_paired(data, return_all_p = TRUE)
+  
+  # Also do individual comparisons for clarity
+  control_scores <- data %>% filter(condition == "control") %>% pull(score)
+  
+  if(show_diagnostics) {
+    cat(sprintf("Sample size: %d\n", n_subjects))
+    cat(sprintf("Effect size: %.1f%%\n\n", effect_size * 100))
+  }
+  
+  if(show_diagnostics) {
+    for (i in 1:5) {
+      treat_name <- paste0("treatment", i)
+      treat_scores <- data %>% filter(condition == treat_name) %>% pull(score)
+      
+      if (length(treat_scores) == length(control_scores)) {
+        test_result <- t.test(treat_scores, control_scores, paired = TRUE)
+        cat(sprintf("%s vs control: mean diff = %.3f, p = %.4f %s\n", 
+                    treat_name, 
+                    mean(treat_scores - control_scores),
+                    test_result$p.value,
+                    ifelse(test_result$p.value < ALPHA_BONFERRONI, "**", 
+                           ifelse(test_result$p.value < ALPHA_STANDARD, "*", ""))))
+      }
+    }
+    
+    cat(sprintf("\nMinimum p-value: %.4f\n", min(all_p_values)))
+    cat(sprintf("Significant at α=0.05? %s\n", ifelse(min(all_p_values) < ALPHA_STANDARD, "YES", "NO")))
+    cat(sprintf("Significant at α=0.01 (Bonferroni)? %s\n", 
+                ifelse(min(all_p_values) < ALPHA_BONFERRONI, "YES", "NO")))
+    cat("===============================================\n")
+  }
+}
+
+# Run diagnostic
+check_multiple_comparisons(n_subjects = 200, effect_size = 0.05)
+
+# Quick verification that simulation is working
+test_data <- simulate_scores(100)
+test_summary <- test_data %>%
+  mutate(group = ifelse(condition == "control", "control", "treatment")) %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(score),
+    sd_score = sd(score),
+    mean_prop = mean(proportion),
+    .groups = 'drop'
+  )
+if(show_diagnostics) {
+  cat("\nTest simulation (N=100):\n")
+}
+
+print(test_summary)
+```
+
+```{r method1-power}
+
+# Use clear sample sizes for testing
+sample_sizes_sparse <- if(quick_mode) {
+  c(20, 50, 100, 200, 300, 400, 500, 600)
+} else {
+  c(20, 30, 40, 50, 75, 100, 120, 140, 160, 180, 200, 
+    250, 300, 350, 400, 450, 500, 550, 600, 620)
+}
+
+n_sims_main <- if(quick_mode) 100 else 500
+
+# Calculate power for each sample size
+powers_standard <- numeric(length(sample_sizes_sparse))
+powers_bonferroni <- numeric(length(sample_sizes_sparse))
+
+if(show_diagnostics) {
+  cat("\n=== METHOD 1: PAIRED T-TEST POWER CALCULATION ===\n")
+  cat(sprintf("Sample sizes to test: %d\n", length(sample_sizes_sparse)))
+  cat(sprintf("Simulations per size: %d\n", n_sims_main))
+  cat(sprintf("Total simulations: %d\n", length(sample_sizes_sparse) * n_sims_main * 2))
+  cat("==============================================\n\n")
+
+  # Estimate time
+  est_time_per_sim <- 0.001  # seconds
+  est_total_time <- length(sample_sizes_sparse) * n_sims_main * 2 * est_time_per_sim
+  cat(sprintf("Estimated time: %.1f minutes\n\n", est_total_time / 60))
+}
+
+start_time <- Sys.time()
+
+for (i in seq_along(sample_sizes_sparse)) {
+  n <- sample_sizes_sparse[i]
+  iter_start <- Sys.time()
+  
+  if(show_diagnostics) {
+    cat(sprintf("[%d/%d] N=%d: ", i, length(sample_sizes_sparse), n))
+  }
+  
+  # Standard alpha = 0.05
+  if(show_diagnostics) {
+    cat("α=0.05...")
+  }
+  powers_standard[i] <- calculate_power_paired_parallel(n, 
+                                                      n_sims = n_sims_main, 
+                                                      alpha = 0.05,
+                                                      effect_size = EFFECT_SIZE,
+                                                      show_progress = FALSE)
+  if(show_diagnostics) {
+    cat(sprintf("%.3f | ", powers_standard[i]))
+  }
+  
+  # Bonferroni alpha = 0.01
+  if(show_diagnostics) {
+    cat("α=0.01...")
+  }
+  powers_bonferroni[i] <- calculate_power_paired_parallel(n, 
+                                                        n_sims = n_sims_main, 
+                                                        alpha = ALPHA_BONFERRONI,
+                                                        effect_size = EFFECT_SIZE,
+                                                        show_progress = FALSE)
+  if(show_diagnostics) {
+    cat(sprintf("%.3f", powers_bonferroni[i]))
+  }
+  
+  # Time tracking
+  iter_time <- difftime(Sys.time(), iter_start, units = "secs")
+  remaining <- (length(sample_sizes_sparse) - i) * as.numeric(iter_time)
+  if(show_diagnostics) {
+    cat(sprintf(" | %.1fs (ETA: %.1f min)\n", iter_time, remaining/60))
+  }
+  
+  # Early stopping check
+  if (powers_standard[i] >= 0.90 && powers_bonferroni[i] >= 0.90 && i > 5) {
+    if(show_diagnostics) {
+      cat("\nBoth power levels reached 90% - checking a few more sizes...\n")
+    }
+  }
+}
+
+total_time <- difftime(Sys.time(), start_time, units = "secs")
+if(show_diagnostics) {
+  cat(sprintf("\nTotal time: %.1f seconds (%.1f minutes)\n", total_time, total_time/60))
+}
+
+# Find required sample sizes
+required_n_standard <- if(any(powers_standard >= 0.90)) {
+  sample_sizes_sparse[min(which(powers_standard >= 0.90))]
+} else {
+  paste(">", max(sample_sizes_sparse))
+}
+
+required_n_bonferroni <- if(any(powers_bonferroni >= 0.90)) {
+  sample_sizes_sparse[min(which(powers_bonferroni >= 0.90))]
+} else {
+  paste(">", max(sample_sizes_sparse))
+}
+
+if(show_diagnostics) {
+  cat(sprintf("\nRequired N for 90%% power:\n"))
+  cat(sprintf("  Without Bonferroni (α=0.05): %s\n", required_n_standard))
+  cat(sprintf("  With Bonferroni (α=0.01): %s\n", required_n_bonferroni))
+}
+
+# Create results table for key sample sizes
+key_sizes <- c(20, 30, 50, 100, 200, 300, 400, 500, 600)
+key_indices <- which(sample_sizes_sparse %in% key_sizes)
+key_indices <- key_indices[key_indices <= length(sample_sizes_sparse)]
+
+paired_results <- data.frame(
+  Sample_Size = sample_sizes_sparse[key_indices],
+  Power_Standard = sprintf("%.0f%%", powers_standard[key_indices] * 100),
+  Power_Bonferroni = sprintf("%.0f%%", powers_bonferroni[key_indices] * 100)
+) %>%
+  filter(Sample_Size %in% c(100, 200, 300, 400, 500, 600))  # Show only key sizes
+
+kable(paired_results, 
+      caption = "Power by Sample Size with and without Bonferroni Correction") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r method1-plot}
+# Create comparison plot
+power_data <- data.frame(
+  n = rep(sample_sizes_sparse, 2),
+  power = c(powers_standard, powers_bonferroni),
+  correction = rep(c("No correction (α=0.05)", "Bonferroni (α=0.01)"), 
+                   each = length(sample_sizes_sparse))
+)
+
+ggplot(power_data, aes(x = n, y = power, colour = correction)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", colour = "red") +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0, 600, 100)) +
+  scale_colour_manual(values = c("No correction (α=0.05)" = "darkblue", 
+                                "Bonferroni (α=0.01)" = "darkgreen")) +
+  labs(x = "Number of Participants",
+       y = "Statistical Power",
+       title = "Method 1: Paired t-test on Scores",
+       subtitle = sprintf("Required N: %s (no correction), %s (Bonferroni)", 
+                         required_n_standard, required_n_bonferroni),
+       colour = "Significance Level") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+### Minimum Detectable Effect with N=620 (Paired t-test Method)
+
+With the maximum planned sample size of 620 participants, and using the paired t-test method, this analysis estimates the minimum effect sizes (improvement over a 75% baseline) required to achieve 90% power:
+
+```{r min-detectable-effect-calc}
+
+# Test a range of effect sizes
+test_effects_mde <- seq(0.01, 0.05, by = 0.001)
+powers_620_standard_mde <- numeric(length(test_effects_mde))
+powers_620_bonf_mde <- numeric(length(test_effects_mde))
+
+n_sims_mde <- if(quick_mode) 50 else 300 # Use a consistent sim number
+
+if(show_diagnostics) {
+  cat(sprintf("Testing %d effect sizes from %.0f%% to %.0f%% for N=620\n", 
+              length(test_effects_mde), 
+              min(test_effects_mde) * 100, 
+              max(test_effects_mde) * 100))
+}
+
+for (i in seq_along(test_effects_mde)) {
+  eff <- test_effects_mde[i]
+  # Minimal cat output as this chunk is include: false
+  
+  powers_620_standard_mde[i] <- calculate_power_paired_parallel(620, 
+                                                          n_sims = n_sims_mde, 
+                                                          alpha = 0.05, 
+                                                          effect_size = eff,
+                                                          show_progress = FALSE)
+  
+  powers_620_bonf_mde[i] <- calculate_power_paired_parallel(620, 
+                                                      n_sims = n_sims_mde, 
+                                                      alpha = ALPHA_BONFERRONI, 
+                                                      effect_size = eff,
+                                                      show_progress = FALSE)
+  
+  if (powers_620_standard_mde[i] >= 0.90 && powers_620_bonf_mde[i] >= 0.90 && i < length(test_effects_mde)) {
+    powers_620_standard_mde[(i+1):length(test_effects_mde)] <- NA
+    powers_620_bonf_mde[(i+1):length(test_effects_mde)] <- NA
+    break 
+  }
+}
+
+# Find minimum detectable effect (excluding NAs)
+valid_idx_mde_std <- !is.na(powers_620_standard_mde)
+min_effect_standard_620 <- if(any(powers_620_standard_mde[valid_idx_mde_std] >= 0.90, na.rm = TRUE)) {
+  test_effects_mde[valid_idx_mde_std][min(which(powers_620_standard_mde[valid_idx_mde_std] >= 0.90))]
+} else {
+  NA # Or some other indicator like "> max tested effect"
+}
+
+valid_idx_mde_bonf <- !is.na(powers_620_bonf_mde)
+min_effect_bonferroni_620 <- if(any(powers_620_bonf_mde[valid_idx_mde_bonf] >= 0.90, na.rm = TRUE)) {
+  test_effects_mde[valid_idx_mde_bonf][min(which(powers_620_bonf_mde[valid_idx_mde_bonf] >= 0.90))]
+} else {
+  NA # Or some other indicator
+}
+
+# For display in the text below
+min_effect_std_display <- if (!is.na(min_effect_standard_620)) sprintf("%.1f%%", min_effect_standard_620 * 100) else paste(">", sprintf("%.1f%%", max(test_effects_mde)*100))
+min_effect_bonf_display <- if (!is.na(min_effect_bonferroni_620)) sprintf("%.1f%%", min_effect_bonferroni_620 * 100) else paste(">", sprintf("%.1f%%", max(test_effects_mde)*100))
+
+if(show_diagnostics) {
+  cat(sprintf("Min detectable (N=620, Paired t-test) α=0.05: %s\n", min_effect_std_display))
+  cat(sprintf("Min detectable (N=620, Paired t-test) α=0.01: %s\n", min_effect_bonf_display))
+}
+
+```
+
+-   **Without Bonferroni correction (α = 0.05)**: Effects as small as `r min_effect_std_display`.
+-   **With Bonferroni correction (α = 0.01)**: Effects as small as `r min_effect_bonf_display`.
+
+This provides a clear indication of the study's sensitivity with the maximum proposed sample size using the primary recommended analytical method.
+
+## Method 2: Mixed Effects Models (GLMM)
+
+This approach models the binary outcomes directly using logistic regression with random effects.
+
+```{r method2-functions}
+
+simulate_binary <- function(n_subjects,
+                            p_control      = 0.75,
+                            effect_size    = EFFECT_SIZE,
+                            n_decisions    = 6,
+                            subject_sd     = 0.15,
+                            subj_cond_sd   = 0.05,
+                            practice_effect = 0.01) {
+  # First assign one block per (subject, condition)
+  conditions <- c("control", paste0("treatment", 1:5))
+  block_assign <- do.call(rbind, lapply(seq_len(n_subjects), function(subj) {
+    data.frame(
+      subject   = subj,
+      condition = sample(conditions),  # randomized order
+      block     = 1:6,
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  # Then expand rounds/decisions
+  df <- expand.grid(
+    decision = seq_len(n_decisions),
+    subject = seq_len(n_subjects),
+    condition = conditions,
+    stringsAsFactors = FALSE
+  )
+
+  # Join the block assignments to each row
+  df <- merge(df, block_assign, by = c("subject", "condition"))
+
+  # Subject-level random effects
+  subj_eff <- rnorm(n_subjects, mean = 0, sd = subject_sd)
+  df$subject_effect <- subj_eff[df$subject]
+
+  # Subject-by-condition effects
+  total_subj_cond <- n_subjects * length(conditions)
+  subj_cond_eff <- rnorm(total_subj_cond, mean = 0, sd = subj_cond_sd)
+  key <- paste(df$subject, df$condition)
+  df$subject_condition_effect <- subj_cond_eff[as.numeric(factor(key))]
+
+  # Base probability and practice effect
+  df$base_prob   <- ifelse(df$condition == "control",
+                           p_control,
+                           p_control + effect_size)
+  df$block_effect <- (df$block - 1) * practice_effect
+
+  # Combine on logit scale
+  logit_p <- qlogis(df$base_prob) +
+             df$subject_effect +
+             df$subject_condition_effect +
+             df$block_effect
+  df$p <- plogis(logit_p)
+
+  # Simulate binary outcomes
+  df$correct      <- rbinom(nrow(df), size = 1, prob = df$p)
+  df$is_treatment <- ifelse(df$condition == "control", 0, 1)
+
+  # Convert to proper factor types for GLMM
+  df$subject   <- factor(df$subject)
+  df$condition <- factor(df$condition, levels = c("control", paste0("treatment", 1:5)))
+  df$block     <- factor(df$block)
+
+  return(df)
+
+  return(df)
+}
+
+# GLMM analysis
+analyse_glmm <- function(data, alpha = 0.05) {
+  tryCatch({
+    # First try full model with block
+    suppressWarnings({
+      model <- glmer(correct ~ factor(condition) + factor(block) + (1|subject) + (1|subject:condition), 
+                     data = data, 
+                     family = binomial,
+                     control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 20000)))
+    })
+    
+    # Handle singular fits
+    if (isSingular(model)) {
+      suppressWarnings({
+        model <- glmer(correct ~ factor(condition) + factor(block) + (1|subject), 
+                      data = data, 
+                      family = binomial,
+                      control = glmerControl(optimizer = "bobyqa"))
+      })
+      
+      if (isSingular(model)) {
+        model <- glmer(correct ~ factor(condition) + (1|subject), 
+                      data = data, 
+                      family = binomial,
+                      control = glmerControl(optimizer = "bobyqa"))
+      }
+    }
+    
+    # Extract coefficients
+    coef_summary <- summary(model)$coefficients
+    
+    # Find treatment coefficients (control is reference level)
+    treatment_rows <- grep("factor\\(condition\\)treatment", rownames(coef_summary))
+    
+    if (length(treatment_rows) == 0) {
+      return(NA)
+    }
+    
+    # Extract p-values for each treatment vs control comparison
+    p_values <- coef_summary[treatment_rows, "Pr(>|z|)"]
+    
+    # Return minimum p-value (most significant comparison)
+    return(min(p_values, na.rm = TRUE))
+    
+  }, error = function(e) {
+    # Debug: print error only if not in quick mode
+    if (exists("quick_mode") && !quick_mode) {
+      cat("GLMM error:", e$message, "\n")
+    }
+    return(NA)
+  })
+}
+
+# Calculate power for GLMM with progress
+calculate_power_glmm <- function(n_subjects, n_sims = 500, alpha = 0.05) {
+  
+  # Non-parallel version
+  if (!use_parallel) {
+    p_values <- numeric(n_sims)
+    n_valid <- 0
+    
+    for (i in 1:n_sims) {
+      data <- simulate_binary(n_subjects)
+      p_val <- analyse_glmm(data)
+      if (!is.na(p_val)) {
+        p_values[i] <- p_val
+        n_valid <- n_valid + 1
+      }
+    }
+    
+    if (n_valid == 0) return(NA)
+    
+    # Calculate power based on valid p-values only
+    return(sum(p_values[1:n_valid] < alpha) / n_valid)
+  }
+  
+  # Parallel version
+  tryCatch({
+    # Set up cluster
+    cl <- parallel::makeCluster(n_cores)
+    on.exit(parallel::stopCluster(cl))
+    
+    # Export required objects
+    parallel::clusterExport(cl, c("simulate_binary", "analyse_glmm", "n_subjects"), 
+                  envir = environment())
+    
+    # Load packages on all workers
+    parallel::clusterEvalQ(cl, {
+      library(lme4)
+      library(stats)
+      library(dplyr)  # Need this for the data manipulation in simulate_binary
+    })
+    
+    # Simulation function
+    sim_function <- function(i, n_subj) {
+      tryCatch({
+        data <- simulate_binary(n_subj)
+        analyse_glmm(data)
+      }, error = function(e) NA)
+    }
+    
+    # Export and run - use pbsapply only in interactive mode
+    parallel::clusterExport(cl, "sim_function", envir = environment())
+    
+    if (interactive()) {
+      p_values <- pbsapply(1:n_sims, sim_function, n_subj = n_subjects, cl = cl)
+    } else {
+      p_values <- parallel::parSapply(cl, 1:n_sims, sim_function, n_subj = n_subjects)
+    }
+    
+    # Remove NA values and calculate power
+    valid_p_values <- p_values[!is.na(p_values)]
+    
+    if (length(valid_p_values) == 0) return(NA)
+    
+    return(sum(valid_p_values < alpha) / length(valid_p_values))
+    
+  }, error = function(e) {
+    warning("Parallel GLMM failed, using sequential: ", e$message)
+    # Fallback to sequential
+    p_values <- numeric(n_sims)
+    n_valid <- 0
+    
+    for (i in 1:n_sims) {
+      data <- simulate_binary(n_subjects)
+      p_val <- analyse_glmm(data)
+      if (!is.na(p_val)) {
+        p_values[i] <- p_val
+        n_valid <- n_valid + 1
+      }
+    }
+    
+    if (n_valid == 0) return(NA)
+    
+    return(sum(p_values[1:n_valid] < alpha) / n_valid)
+  })
+}
+```
+
+```{r method2-power}
+
+# Test fewer sample sizes for GLMM (it's slower)
+test_sizes <- if(quick_mode) c(100, 300, 500) else c(100, 200, 300, 400, 500, 600)
+n_sims_glmm <- if(quick_mode) 50 else 200
+
+glmm_powers_standard <- numeric(length(test_sizes))
+glmm_powers_bonferroni <- numeric(length(test_sizes))
+
+if (interactive()) {
+  cat("\n=== METHOD 2: GLMM POWER CALCULATION ===\n")
+  cat(sprintf("Sample sizes to test: %d\n", length(test_sizes)))
+  cat(sprintf("Simulations per size: %d\n", n_sims_glmm))
+  cat(sprintf("Total model fits: %d\n", length(test_sizes) * n_sims_glmm * 2))
+  cat("WARNING: GLMM is slower than paired t-test\n")
+  cat("========================================\n\n")
+}
+
+start_time <- Sys.time()
+
+for (i in seq_along(test_sizes)) {
+  n <- test_sizes[i]
+  iter_start <- Sys.time()
+  
+  if (interactive()) {
+    cat(sprintf("[%d/%d] N=%d: ", i, length(test_sizes), n))
+  }
+  
+  # Standard alpha
+  if (interactive()) {
+    cat("Fitting models for α=0.05...")
+  }
+  glmm_powers_standard[i] <- calculate_power_glmm(n, 
+                                                 n_sims = n_sims_glmm,
+                                                 alpha = 0.05)
+  if (interactive()) {
+    cat(sprintf("%.3f | ", glmm_powers_standard[i]))
+  }
+  
+  # Bonferroni
+  if (interactive()) {
+    cat("α=0.01...")
+  }
+  glmm_powers_bonferroni[i] <- calculate_power_glmm(n, 
+                                                    n_sims = n_sims_glmm,
+                                                    alpha = ALPHA_BONFERRONI)
+  if (interactive()) {
+    cat(sprintf("%.3f", glmm_powers_bonferroni[i]))
+  }
+  
+  # Time tracking
+  iter_time <- difftime(Sys.time(), iter_start, units = "secs")
+  remaining <- (length(test_sizes) - i) * as.numeric(iter_time)
+  if (show_diagnostics) {
+    cat(sprintf(" | %.1fs (ETA: %.1f min)\n", iter_time, remaining/60))
+  }
+}
+
+total_time <- difftime(Sys.time(), start_time, units = "secs")
+if (interactive()) {
+  cat(sprintf("\nTotal time: %.1f seconds (%.1f minutes)\n", total_time, total_time/60))
+}
+
+glmm_results <- data.frame(
+  Sample_Size = test_sizes,
+  Power_Standard = round(glmm_powers_standard, 3),
+  Power_Bonferroni = round(glmm_powers_bonferroni, 3),
+  Method = "GLMM"
+)
+
+kable(glmm_results, 
+      caption = "Power estimates using GLMM",
+      col.names = c("Sample Size", "Power (α=0.05)", "Power (α=0.01)", "Method")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r method2-power-simr}
+
+# Fit initial model with smaller sample
+initial_data_glmm <- simulate_binary(100)
+initial_data_glmm$block <- initial_data_glmm$decision  # Add block variable
+
+base_glmm <- glmer(
+  correct ~ is_treatment + factor(block) + (1|subject) + (1|subject:condition),
+  data = initial_data_glmm,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+# Set effect size to match your target (log odds for 5% increase)
+fixef(base_glmm)["is_treatment"] <- log((0.80/0.20) / (0.75/0.25))
+
+# Extend and calculate power curve
+glmm_extended <- extend(base_glmm, along = "subject", n = 600)
+power_curve_glmm <- powerCurve(
+  glmm_extended, 
+  along = "subject",
+  breaks = c(100, 200, 300, 400, 500, 600),
+  nsim = if(quick_mode) 50 else 200,
+  alpha = ALPHA_BONFERRONI,  # Bonferroni corrected
+  progress = FALSE
+)
+
+print(power_curve_glmm)
+plot(power_curve_glmm)
+
+```
+
+## Method 3: Generalised Estimating Equations (GEE)
+
+GEE is a robust alternative that handles correlation without convergence issues.
+
+```{r method3-functions}
+
+# GEE analysis
+analyse_gee <- function(data, alpha = 0.05) {
+  tryCatch({
+    suppressWarnings({
+      model <- geeglm(correct ~ factor(condition), 
+                      id = subject,
+                      data = data, 
+                      family = binomial,
+                      corstr = "exchangeable")
+    })
+    
+    # Extract coefficients
+    coef_summary <- summary(model)$coefficients
+    
+    # Find treatment coefficients (control is reference level)
+    treatment_rows <- grep("factor\\(condition\\)treatment", rownames(coef_summary))
+    
+    if (length(treatment_rows) == 0) {
+      return(NA)
+    }
+    
+    # Extract p-values for each treatment vs control comparison
+    p_values <- coef_summary[treatment_rows, "Pr(>|W|)"]
+    
+    # Return minimum p-value (most significant comparison)
+    return(min(p_values, na.rm = TRUE))
+    
+  }, error = function(e) NA)
+}
+
+# Calculate power for GEE with progress
+calculate_power_gee <- function(n_subjects, n_sims = 500, alpha = 0.05) {
+  
+  # Non-parallel version
+  if (!use_parallel) {
+    p_values <- replicate(n_sims, {
+      data <- simulate_binary(n_subjects)
+      analyse_gee(data)
+    })
+    return(mean(p_values < alpha, na.rm = TRUE))
+  }
+  
+  # Parallel version
+  tryCatch({
+    # Set up cluster
+    cl <- parallel::makeCluster(n_cores)
+    on.exit(parallel::stopCluster(cl))
+    
+    # Export required objects
+    parallel::clusterExport(cl, c("simulate_binary", "analyse_gee", "n_subjects"), 
+                  envir = environment())
+    
+    # Load packages on all workers
+    parallel::clusterEvalQ(cl, {
+      library(geepack)
+      library(stats)
+    })
+    
+    # Simulation function
+    sim_function <- function(i, n_subj) {
+      tryCatch({
+        data <- simulate_binary(n_subj)
+        analyse_gee(data)
+      }, error = function(e) NA)
+    }
+    
+    # Export and run
+    parallel::clusterExport(cl, "sim_function", envir = environment())
+    p_values <- pbsapply(1:n_sims, sim_function, n_subj = n_subjects, cl = cl)
+    
+    mean(p_values < alpha, na.rm = TRUE)
+    
+  }, error = function(e) {
+    warning("Parallel GEE failed, using sequential")
+    p_values <- replicate(n_sims, {
+      data <- simulate_binary(n_subjects)
+      analyse_gee(data)
+    })
+    mean(p_values < alpha, na.rm = TRUE)
+  })
+}
+```
+
+```{r method3-power}
+
+# Test GEE approach with same sample sizes
+gee_powers_standard <- numeric(length(test_sizes))
+gee_powers_bonferroni <- numeric(length(test_sizes))
+
+if(show_diagnostics) {
+  cat(sprintf("Sample sizes to test: %d\n", length(test_sizes)))
+  cat(sprintf("Simulations per size: %d\n", n_sims_glmm))
+  cat("GEE is typically faster than GLMM\n")
+  cat("======================================\n\n")
+}
+
+start_time <- Sys.time()
+
+for (i in seq_along(test_sizes)) {
+  n <- test_sizes[i]
+  iter_start <- Sys.time()
+  
+  if(show_diagnostics) {
+    cat(sprintf("[%d/%d] N=%d: ", i, length(test_sizes), n))
+  }
+  
+  # Standard alpha
+  if(show_diagnostics) {
+    cat("α=0.05...")
+  }
+  gee_powers_standard[i] <- calculate_power_gee(n, 
+                                               n_sims = n_sims_glmm,
+                                               alpha = 0.05)
+  if(show_diagnostics) {
+    cat(sprintf("%.3f | ", gee_powers_standard[i]))
+  }
+  
+  # Bonferroni
+  if(show_diagnostics) {
+    cat("α=0.01...")
+  }
+  gee_powers_bonferroni[i] <- calculate_power_gee(n, 
+                                                  n_sims = n_sims_glmm,
+                                                  alpha = ALPHA_BONFERRONI)
+  if(show_diagnostics) {
+    cat(sprintf("%.3f", gee_powers_bonferroni[i]))
+  }
+  
+  # Time tracking
+  iter_time <- difftime(Sys.time(), iter_start, units = "secs")
+  remaining <- (length(test_sizes) - i) * as.numeric(iter_time)
+  if(show_diagnostics) {
+    cat(sprintf(" | %.1fs (ETA: %.1f min)\n", iter_time, remaining/60))
+  }
+}
+
+total_time <- difftime(Sys.time(), start_time, units = "secs")
+if(show_diagnostics) {
+  cat(sprintf("\nTotal time: %.1f seconds (%.1f minutes)\n", total_time, total_time/60))
+}
+
+gee_results <- data.frame(
+  Sample_Size = test_sizes,
+  Power_Standard = round(gee_powers_standard, 3),
+  Power_Bonferroni = round(gee_powers_bonferroni, 3),
+  Method = "GEE"
+)
+
+kable(gee_results, 
+      caption = "Power estimates using GEE",
+      col.names = c("Sample Size", "Power (α=0.05)", "Power (α=0.01)", "Method")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Method Comparison
+
+```{r comparison}
+# For method comparison, calculate paired t-test for same sizes if needed
+paired_powers_standard <- numeric(length(test_sizes))
+paired_powers_bonferroni <- numeric(length(test_sizes))
+
+for (i in seq_along(test_sizes)) {
+  idx <- which(sample_sizes_sparse == test_sizes[i])
+  if (length(idx) > 0) {
+    paired_powers_standard[i] <- powers_standard[idx]
+    paired_powers_bonferroni[i] <- powers_bonferroni[idx]
+  } else {
+    # Calculate it now
+    paired_powers_standard[i] <- calculate_power_paired_parallel(test_sizes[i], 
+                                                               n_sims = n_sims_glmm, 
+                                                               alpha = 0.05,
+                                                               show_progress = FALSE)
+    paired_powers_bonferroni[i] <- calculate_power_paired_parallel(test_sizes[i], 
+                                                                 n_sims = n_sims_glmm, 
+                                                                 alpha = ALPHA_BONFERRONI,
+                                                                 show_progress = FALSE)
+  }
+}
+
+# Combine all results
+comparison_data <- bind_rows(
+  glmm_results %>% select(-Method) %>% 
+    pivot_longer(cols = starts_with("Power"), 
+                 names_to = "Correction", 
+                 values_to = "Power") %>%
+    mutate(Method = "GLMM"),
+  gee_results %>% select(-Method) %>% 
+    pivot_longer(cols = starts_with("Power"), 
+                 names_to = "Correction", 
+                 values_to = "Power") %>%
+    mutate(Method = "GEE")
+) %>%
+  mutate(Correction = case_when(
+    Correction == "Power_Standard" ~ "No correction (α=0.05)",
+    Correction == "Power_Bonferroni" ~ "Bonferroni (α=0.01)"
+  ))
+
+# Add paired t-test results
+paired_comparison <- data.frame(
+  Sample_Size = test_sizes,
+  Power = c(paired_powers_standard, paired_powers_bonferroni),
+  Correction = rep(c("No correction (α=0.05)", "Bonferroni (α=0.01)"), 
+                   each = length(test_sizes)),
+  Method = "Paired t-test"
+)
+
+all_comparison <- bind_rows(comparison_data, paired_comparison)
+
+# Comparison plot
+ggplot(all_comparison, aes(x = Sample_Size, y = Power, 
+                          colour = Method, linetype = Correction)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.90, linetype = "dotted", colour = "red") +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(100, 600, 100)) +
+  labs(x = "Number of Participants",
+       y = "Statistical Power",
+       title = "Comparison of Analysis Methods",
+       subtitle = "Effect of Bonferroni correction across methods") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(colour = guide_legend(nrow = 1),
+         linetype = guide_legend(nrow = 1))
+```
+
+## Sensitivity Analysis
+
+How does power change with different effect sizes?
+
+```{r sensitivity}
+
+# Test different effect sizes with fixed sample sizes
+effect_sizes <- c(0.03, 0.05, 0.07, 0.10)
+test_ns <- c(150, 250, 450, 600)
+n_sims_sens <- if(quick_mode) 50 else 300
+
+# Use parallel processing for sensitivity analysis
+sensitivity_results <- expand_grid(
+  N = test_ns,
+  effect = effect_sizes
+)
+
+if(show_diagnostics) {
+  cat(sprintf("Effect sizes: %s\n", paste(sprintf("%.0f%%", effect_sizes * 100), collapse=", ")))
+  cat(sprintf("Sample sizes: %s\n", paste(test_ns, collapse=", ")))
+  cat(sprintf("Combinations: %d\n", nrow(sensitivity_results)))
+  cat(sprintf("Simulations each: %d\n", n_sims_sens * 2))
+  cat("===========================\n\n")
+}
+
+start_time <- Sys.time()
+
+# Calculate power for each combination
+power_results <- list()
+for (i in 1:nrow(sensitivity_results)) {
+  n <- sensitivity_results$N[i]
+  eff <- sensitivity_results$effect[i]
+  iter_start <- Sys.time()
+  
+  if(show_diagnostics) {
+    cat(sprintf("[%d/%d] N=%d, Effect=%.0f%%: ", 
+                i, nrow(sensitivity_results), n, eff * 100))
+  }
+  
+  # Standard alpha
+  if(show_diagnostics) {
+    cat("α=0.05...")
+  }
+  power_std <- calculate_power_paired_parallel(
+    n, 
+    n_sims = n_sims_sens, 
+    alpha = 0.05, 
+    effect_size = eff,
+    show_progress = FALSE
+  )
+  if(show_diagnostics) {
+    cat(sprintf("%.3f | ", power_std))
+  }
+  
+  # Bonferroni
+  if(show_diagnostics) {
+    cat("α=0.01...")
+  }
+  power_bonf <- calculate_power_paired_parallel(
+    n, 
+    n_sims = n_sims_sens, 
+    alpha = ALPHA_BONFERRONI, 
+    effect_size = eff,
+    show_progress = FALSE
+  )
+  if(show_diagnostics) {
+    cat(sprintf("%.3f", power_bonf))
+  }
+  
+  power_results[[i]] <- list(
+    Power_Standard = power_std,
+    Power_Bonferroni = power_bonf
+  )
+  
+  # Time tracking
+  iter_time <- difftime(Sys.time(), iter_start, units = "secs")
+  remaining <- (nrow(sensitivity_results) - i) * as.numeric(iter_time)
+  if(show_diagnostics) {
+    cat(sprintf(" | %.1fs (ETA: %.1f min)\n", iter_time, remaining/60))
+  }
+}
+
+total_time <- difftime(Sys.time(), start_time, units = "secs")
+if(show_diagnostics) {
+  cat(sprintf("\nTotal time: %.1f seconds (%.1f minutes)\n", total_time, total_time/60))
+}
+
+# Combine results
+sensitivity_results <- sensitivity_results %>%
+  mutate(
+    Power_Standard = map_dbl(power_results, ~.x$Power_Standard),
+    Power_Bonferroni = map_dbl(power_results, ~.x$Power_Bonferroni),
+    Effect_Size = sprintf("%.0f%%", effect * 100),
+    Control_Score = 0.75 * 6,
+    Treatment_Score = (0.75 + effect) * 6,
+    Difference = effect * 6,
+    Power_Standard = round(Power_Standard, 3),
+    Power_Bonferroni = round(Power_Bonferroni, 3)
+  ) %>%
+  select(N, Effect_Size, Control_Score, Treatment_Score, Difference, 
+         Power_Standard, Power_Bonferroni)
+
+# Display as grouped table
+kable(sensitivity_results,
+      caption = "Power for different effect sizes and sample sizes",
+      col.names = c("N", "Effect Size", "Control Score", "Treatment Score", 
+                   "Difference", "Power (α=0.05)", "Power (α=0.01)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r sensitivity-plot}
+# Sensitivity plot
+sensitivity_plot_data <- sensitivity_results %>%
+  pivot_longer(cols = starts_with("Power"), 
+               names_to = "Correction", 
+               values_to = "Power") %>%
+  mutate(
+    Effect_Numeric = as.numeric(gsub("%", "", Effect_Size)),
+    Correction = ifelse(Correction == "Power_Standard", 
+                       "No correction", "Bonferroni"),
+    N_factor = factor(N)
+  )
+
+ggplot(sensitivity_plot_data, 
+       aes(x = Effect_Numeric, y = Power, 
+           colour = N_factor, linetype = Correction)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 0.90, linetype = "dotted", colour = "red") +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = c(3, 5, 7, 10)) +
+  labs(x = "Effect Size (%)",
+       y = "Statistical Power",
+       title = "Sensitivity Analysis: Power vs Effect Size",
+       subtitle = "Impact of sample size and Bonferroni correction",
+       colour = "Sample Size",
+       linetype = "Correction") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Robustness Check: Order and Practice Effects
+
+Your analysis assumes no order or practice effects. Let's check how robust the results are when we account for participants improving over time.
+
+```{r order-effects-setup}
+# Modified simulation with block/order effects
+simulate_scores_with_blocks <- function(n_subjects, 
+                                       p_control = 0.75,
+                                       effect_size = EFFECT_SIZE,
+                                       n_decisions = 6,
+                                       subject_sd = 0.15,
+                                       practice_effect = 0.01) {
+  
+  results <- data.frame()
+  
+  # Randomize condition order for each subject
+  for (subj in 1:n_subjects) {
+    subject_effect <- rnorm(1, 0, subject_sd)
+    
+    # Random order for this subject
+    conditions <- sample(c("control", paste0("treatment", 1:5)))
+    
+    for (block in 1:6) {
+      cond <- conditions[block]
+      
+      # Add small practice effect (improvement over blocks)
+      # Each block adds 1% to success probability
+      block_effect <- (block - 1) * practice_effect
+      
+      # Calculate probability
+      p <- ifelse(cond == "control", p_control, p_control + effect_size)
+      logit_p <- qlogis(p) + subject_effect + block_effect
+      p_final <- plogis(logit_p)
+      
+      score <- rbinom(1, n_decisions, p_final)
+      
+      results <- rbind(results, data.frame(
+        subject = subj,
+        condition = cond,
+        block = block,
+        score = score,
+        proportion = score / n_decisions
+      ))
+    }
+  }
+  
+  return(results)
+}
+
+# Power calculation with order effects
+calculate_power_with_blocks <- function(n_subjects, 
+                                       n_sims = 300,
+                                       alpha = ALPHA_BONFERRONI,
+                                       effect_size = EFFECT_SIZE,
+                                       practice_effect = 0.01) {
+  
+  successes <- 0
+  
+  for (i in 1:n_sims) {
+    data <- simulate_scores_with_blocks(n_subjects, 
+                                       effect_size = effect_size,
+                                       practice_effect = practice_effect)
+    min_p <- analyse_paired(data, return_all_p = FALSE)
+    
+    if (!is.na(min_p) && min_p < alpha) {
+      successes <- successes + 1
+    }
+  }
+  
+  return(successes / n_sims)
+}
+
+```
+
+### 3. Run the comparison
+
+```{r order-effects-comparison}
+
+# Test a few key sample sizes
+test_sizes_order <- c(200, 300, 400, 500, 600)
+n_sims_order <- if(quick_mode) 100 else 300
+
+if(show_diagnostics) {
+  cat("Testing impact of practice effects on power\n")
+  cat("Practice effect: 1% improvement per block\n")
+  cat("=======================================\n\n")
+}
+
+# Compare with and without order effects
+comparison_results <- data.frame()
+
+for (n in test_sizes_order) {
+  if(show_diagnostics) {
+    cat(sprintf("N=%d: ", n))
+  }
+  
+  # Original (no order effects)
+  power_original <- calculate_power_paired_parallel(n, 
+                                                   n_sims = n_sims_order,
+                                                   alpha = ALPHA_BONFERRONI,
+                                                   show_progress = FALSE)
+  if(show_diagnostics) {
+    cat(sprintf("Original=%.3f | ", power_original))
+  }
+  
+  # With order effects
+  power_with_order <- calculate_power_with_blocks(n,
+                                                  n_sims = n_sims_order,
+                                                  alpha = ALPHA_BONFERRONI)
+  if(show_diagnostics) {
+    cat(sprintf("With order=%.3f", power_with_order))
+  }
+  
+  # Store results
+  comparison_results <- rbind(comparison_results, data.frame(
+    N = n,
+    Power_Original = power_original,
+    Power_With_Order = power_with_order,
+    Power_Reduction = power_original - power_with_order
+  ))
+  
+  if(show_diagnostics) {
+    cat("\n")
+  }
+}
+
+# Display results
+kable(comparison_results %>%
+        mutate(across(c(Power_Original, Power_With_Order, Power_Reduction), 
+                     ~round(., 3))),
+      caption = "Impact of order/practice effects on power",
+      col.names = c("Sample Size", "Power (No Order Effects)", 
+                   "Power (With Practice Effects)", "Power Loss")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Find new required N with order effects
+required_n_with_order <- NA
+for (n in seq(400, 800, by = 50)) {
+  power <- calculate_power_with_blocks(n, n_sims = 200, alpha = ALPHA_BONFERRONI)
+  if (power >= 0.90) {
+    required_n_with_order <- n
+    break
+  }
+}
+
+if(show_diagnostics) {
+  cat(sprintf("\n\nRequired N for 90%% power:\n"))
+  cat(sprintf("- Without order effects: %s\n", required_n_bonferroni))
+  cat(sprintf("- With order effects: %s\n", 
+              ifelse(is.na(required_n_with_order), ">800", required_n_with_order)))
+}
+
+```
+
+The analysis with order effects suggests you need `r ifelse(is.na(required_n_with_order), ">800", required_n_with_order)` participants.
+
+## Validation Using simr Package
+
+To validate our results, let's use the `simr` package for power analysis.
+
+```{r simr-setup}
+
+# Generate initial dataset
+set.seed(42)
+initial_n <- 100
+initial_data <- simulate_binary(initial_n, p_control = 0.75, effect_size = 0.05)
+
+# Your structure: blocks correspond to conditions
+# Each participant completes all 6 blocks in random order
+initial_data <- initial_data %>%
+  group_by(subject) %>%
+  mutate(
+    # Map conditions to blocks (randomized per subject)
+    block = as.numeric(factor(condition, 
+                             levels = sample(unique(condition)))),
+    # Decisions 1-6 within each block are the investment decisions
+    trial = decision
+  ) %>%
+  ungroup() %>%
+  arrange(subject, block, trial)
+
+if(show_diagnostics) {
+  # Verify structure matches your experiment
+  cat("Your experimental structure:\n")
+  cat(sprintf("Blocks per subject: %d\n", 
+              n_distinct(initial_data$block)))
+  cat(sprintf("Decisions per block: %d\n", 
+              initial_data %>% filter(subject == 1, block == 1) %>% nrow()))
+  cat(sprintf("Total decisions per subject: %d\n", 
+              initial_data %>% filter(subject == 1) %>% nrow()))
+}        
+
+# Fit model matching your design
+# Block effects capture order (which condition was seen 1st, 2nd, etc.)
+base_model <- glmer(
+  correct ~ is_treatment + factor(block) + (1|subject),
+  data = initial_data,
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 20000))
+)
+
+if(show_diagnostics) {
+  cat("\nModel includes:\n")
+  cat("- Treatment effect (is_treatment)\n")
+  cat("- Block order effects (1st through 6th)\n")
+  cat("- Random subject effects\n")
+}
+
+# Display model summary
+summary(base_model)$coefficients[c("(Intercept)", "is_treatment"), ]
+
+```
+
+```{r simr-effect-size}
+# Check the effect size in our model
+treatment_effect <- fixef(base_model)["is_treatment"]
+if(show_diagnostics) {
+  cat(sprintf("\nTreatment effect (logit scale): %.3f\n", treatment_effect))
+  cat(sprintf("This corresponds to approximately %.1f%% difference\n", 
+              (plogis(treatment_effect) - 0.5) * 100))
+}
+
+# Modify effect size to match 3% (0.03) difference
+# For 75% baseline, 3% increase (75% → 78%) means odds ratio calculation
+target_p_treatment <- 0.75 + EFFECT_SIZE
+target_log_or <- log((target_p_treatment / (1 - target_p_treatment)) / (0.75 / 0.25))
+if(show_diagnostics) {
+  cat(sprintf("\nTarget log odds ratio for %.0f%% effect: %.3f\n", EFFECT_SIZE * 100, target_log_or))
+}
+
+# Set the effect size
+fixef(base_model)["is_treatment"] <- target_log_or
+
+```
+
+```{r simr-power-single}
+#| cache: true
+
+# Test power at current sample size
+if(show_diagnostics) {
+  cat("\n=== POWER AT INITIAL SAMPLE SIZE ===\n")
+  cat(sprintf("Testing power with N=%d (per condition)\n", initial_n))
+}
+
+# Quick power test
+power_base <- powerSim(base_model, 
+                      test = fixed("is_treatment"), 
+                      nsim = if(quick_mode) 50 else 200,
+                      alpha = ALPHA_BONFERRONI,
+                      progress=FALSE)
+print(power_base)
+
+```
+
+```{r simr-extend-analysis}
+#| cache: true
+#| warning: false
+
+# Test specific sample sizes
+test_ns <- c(200, 300, 400, 500, 600)
+power_results_simr <- data.frame()
+
+for (n in test_ns) {
+  if(show_diagnostics) {
+    cat(sprintf("Testing N=%d: ", n))
+  }
+  
+  # Extend the model
+  extended_model <- extend(base_model, along = "subject", n = n)
+  
+  # Calculate power
+  # Note: Using fewer sims for speed
+  power_test <- powerSim(extended_model, 
+                        test = fixed("is_treatment"),
+                        nsim = if(quick_mode) 50 else 100,
+                        alpha = ALPHA_BONFERRONI,
+                        progress = FALSE)
+  
+  # Extract power and CI from simr object
+  power_val <- summary(power_test)$mean
+  power_lower <- summary(power_test)$lower
+  power_upper <- summary(power_test)$upper
+  
+    if(show_diagnostics) {
+      cat(sprintf("%.1f%% [%.1f-%.1f]\n", 
+              power_val * 100, 
+              power_lower * 100, 
+              power_upper * 100))
+    }
+  
+  power_results_simr <- rbind(power_results_simr, data.frame(
+    N = n,
+    Power = power_val,
+    Lower_CI = power_lower,
+    Upper_CI = power_upper,
+    Method = "simr"
+  ))
+}
+
+# Display results table
+simr_table <- power_results_simr %>%
+  select(N, Power, Lower_CI, Upper_CI) %>%
+  mutate(
+    Power_Pct = sprintf("%.1f%%", Power * 100),
+    CI = sprintf("[%.1f%% - %.1f%%]", Lower_CI * 100, Upper_CI * 100)
+  ) %>%
+  select(N, Power_Pct, CI)
+
+kable(simr_table,
+      caption = "Power estimates using simr package",
+      col.names = c("Sample Size", "Power", "95% CI")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r simr-power-curve}
+#| fig.height: 6
+
+# We already have power estimates from simr-extend-analysis
+# Just plot those
+ggplot(power_results_simr, aes(x = N, y = Power)) +
+  geom_ribbon(aes(ymin = Lower_CI, ymax = Upper_CI), alpha = 0.2, fill = "blue") +
+  geom_line(size = 1.2, color = "blue") +
+  geom_point(size = 3, color = "blue") +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "red") +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(100, 600, 100)) +
+  labs(x = "Number of Participants",
+       y = "Statistical Power",
+       title = "Power Analysis using simr Package",
+       subtitle = "Bonferroni corrected (α = 0.01) with 95% CI") +
+  theme_minimal()
+
+# Create a summary table
+if(show_diagnostics) {
+  cat("\nPower Summary:\n")
+}
+print(power_results_simr %>%
+  mutate(
+    Power_Pct = sprintf("%.1f%%", Power * 100),
+    CI = sprintf("[%.1f%% - %.1f%%]", Lower_CI * 100, Upper_CI * 100),
+    Meets_90 = ifelse(Power >= 0.90, "Yes", "No")
+  ) %>%
+  select(N, Power_Pct, CI, Meets_90))
+
+# Find where we cross 90% power
+power_90_n <- power_results_simr %>%
+  filter(Power >= 0.90) %>%
+  slice(1) %>%
+  pull(N)
+
+if(length(power_90_n) > 0) {
+  if(show_diagnostics) {
+    cat(sprintf("\n90%% power achieved at N = %d\n", power_90_n))
+  }
+} else {
+  if(show_diagnostics) {
+    cat("\n90% power not achieved in tested range (up to N = %d)\n", max(power_results_simr$N))
+  }
+  
+  # Estimate where 90% might be achieved
+  if(max(power_results_simr$Power) > 0.80) {
+    # Simple linear extrapolation from last two points
+    last_two <- tail(power_results_simr, 2)
+    slope <- (last_two$Power[2] - last_two$Power[1]) / (last_two$N[2] - last_two$N[1])
+    estimated_n <- last_two$N[2] + (0.90 - last_two$Power[2]) / slope
+    if(show_diagnostics) {
+      cat(sprintf("Estimated N for 90%% power: approximately %.0f\n", estimated_n))
+    }
+  }
+}
+
+# Calculate N for ~80% power from simr results for the table display
+# This is for the cell: | N for 80% power | ~`r n_for_80_power_simr_display` | 300 per group |
+# Try to find N for power between 75% and 85%
+pulled_N_for_80_simr <- power_results_simr %>%
+  filter(Power >= 0.75, Power < 0.85) %>%
+  pull(N)
+
+if (length(pulled_N_for_80_simr) > 0) {
+  n_for_80_power_simr_display <- paste("~", as.character(min(pulled_N_for_80_simr)), sep="")
+} else {
+  # If nothing in 0.75-0.85, try 0.75-0.90 (exclusive of 0.90)
+  pulled_N_for_80_simr_wider <- power_results_simr %>%
+    filter(Power >= 0.75, Power < 0.90) %>%
+    pull(N)
+  if (length(pulled_N_for_80_simr_wider) > 0) {
+    n_for_80_power_simr_display <- paste("~", as.character(min(pulled_N_for_80_simr_wider)), sep="")
+  } else {
+    # If still nothing, check if max power is below 0.75
+    if (max(power_results_simr$Power, na.rm = TRUE) < 0.75) {
+      n_for_80_power_simr_display <- paste(">", max(power_results_simr$N), "(Power <75%)")
+    } else {
+      # If max power is >= 0.75 but no specific N yielded power in the 0.75-0.89 range
+      # (e.g., power jumped from <0.75 to >=0.90, or only one N tested and it was >=0.90)
+      # Fallback: find N for highest power that is less than 90%
+      closest_N_df <- power_results_simr %>% filter(Power < 0.90) %>% arrange(desc(Power)) %>% slice(1)
+      if(nrow(closest_N_df) > 0){
+         n_for_80_power_simr_display <- paste("~", closest_N_df$N, " (", sprintf("%.0f%%", closest_N_df$Power*100), ")", sep="")
+      } else {
+         # If all tested Ns are >= 90% power or no Ns tested under 90%
+         n_for_80_power_simr_display <- "<200 (Power >90%)" # Default if smallest N (200) already >90%
+      }
+    }
+  }
+}
+```
+
+```{r simr-comparison}
+
+# Compare simr results with your custom simulation
+comparison_simr <- power_results_simr %>%
+  select(N, Power_simr = Power) %>%
+  left_join(
+    comparison_results %>% 
+      select(N, Power_custom = Power_With_Order),
+    by = "N"
+  ) %>%
+  mutate(
+    Power_simr = round(Power_simr, 3),
+    Power_custom = round(Power_custom, 3),
+    Difference = round(Power_simr - Power_custom, 3)
+  )
+
+kable(comparison_simr,
+      caption = "Comparison: simr package vs custom simulation",
+      col.names = c("Sample Size", "Power (simr)", "Power (Custom)", "Difference")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Find required N using simr
+required_n_simr <- power_results_simr %>%
+  filter(Power >= 0.90) %>%
+  pull(N) %>%
+  min()
+
+if (length(required_n_simr) == 0) {
+  required_n_simr <- ">600"
+} else {
+  required_n_simr <- as.character(required_n_simr)
+}
+
+```
+
+### Interpretation of simr Results
+
+Using the `simr` package:
+
+- **Required N for 90% power**: `r required_n_simr` participants
+- **Consistency check**: The simr results `r ifelse(any(abs(comparison_simr$Difference) > 0.1, na.rm = TRUE), "differ somewhat from", "closely match")` our custom simulation.
+- **Model complexity**: The GLMM includes block and decision effects, making it more realistic than our simple paired t-test.
+
+The results are reasonably aligned when accounting for:
+- Your larger effect size (5% vs 3%)
+- Your multiple comparisons requiring Bonferroni correction
+- Similar modelling of order effects
+
+# Sample Size Recommendations
+
+```{r calculate-requirements}
+
+# Calculate required N for different effect sizes
+if(show_diagnostics) {
+  cat("Target power: 90%\n")
+  cat(sprintf("Primary effect size: %.0f%%\n", EFFECT_SIZE * 100))
+  cat("Additional effect sizes: 7%, 10%\n")
+  cat("=====================================\n\n")
+}
+
+# We need to calculate power curves for 3%, 7%, and 10% effects
+# Use a smaller set of sample sizes for efficiency
+search_sizes <- c(20, 30, 50, 75, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 620)
+n_sims_req <- if(quick_mode) 50 else 300
+
+# Function to find required N
+find_required_n <- function(effect_size, alpha = 0.05, target_power = 0.90) {
+  if(show_diagnostics) {
+    cat(sprintf("Searching for N (effect=%.0f%%, α=%.2f): ", effect_size * 100, alpha))
+  }
+  
+  for (i in seq_along(search_sizes)) {
+    n <- search_sizes[i]
+    power <- calculate_power_paired_parallel(n, 
+                                           n_sims = n_sims_req,
+                                           alpha = alpha,
+                                           effect_size = effect_size,
+                                           show_progress = FALSE)
+    
+    if(show_diagnostics) {
+      cat(sprintf("N=%d(%.2f) ", n, power))
+    }
+    
+    # Early stopping if we've found it
+    if (power >= target_power) {
+      if(show_diagnostics) {
+        cat(sprintf("\n  --> Required N = %d\n", n))
+      }
+      return(n)
+    }
+  }
+  
+  if(show_diagnostics) {
+    cat(sprintf("\n  --> Required N > %d\n", max(search_sizes)))
+  }
+  return(paste(">", max(search_sizes)))
+}
+
+# Calculate for each effect size
+if(show_diagnostics) {
+  cat("\nWithout Bonferroni correction (α=0.05):\n")
+}
+required_3pct_standard <- find_required_n(EFFECT_SIZE, alpha = 0.05)
+required_7pct_standard <- find_required_n(0.07, alpha = 0.05)
+required_10pct_standard <- find_required_n(0.10, alpha = 0.05)
+
+if(show_diagnostics) {
+  cat("\nWith Bonferroni correction (α=0.01):\n")
+}
+required_3pct_bonferroni <- find_required_n(EFFECT_SIZE, alpha = ALPHA_BONFERRONI)
+required_7pct_bonferroni <- find_required_n(0.07, alpha = ALPHA_BONFERRONI)
+required_10pct_bonferroni <- find_required_n(0.10, alpha = ALPHA_BONFERRONI)
+
+if(show_diagnostics) {
+  cat("\nSample size search complete.\n")
+}
+```
+
+Based on the paired t-test approach with 6 decisions per round:
+
+### Without Bonferroni Correction (α = 0.05)
+
+- **For 3% effect (75% → 78%)**: N = `r required_3pct_standard` participants
+- **For 5% effect (75% → 80%)**: N = `r required_n_standard` participants
+- **For 7% effect (75% → 82%)**: N = `r required_7pct_standard` participants
+- **For 10% effect (75% → 85%)**: N = `r required_10pct_standard` participants
+
+### With Bonferroni Correction (α = 0.01)
+
+- **For 3% effect (75% → 78%)**: N = `r required_3pct_bonferroni` participants
+- **For 5% effect (75% → 80%)**: N = `r required_n_bonferroni` participants
+- **For 7% effect (75% → 82%)**: N = `r required_7pct_bonferroni` participants
+- **For 10% effect (75% → 85%)**: N = `r required_10pct_bonferroni` participants
+
+## Simulation Parameters
+
+- Subject random effects: SD = 0.05-0.10 on probability scale
+- No learning/fatigue effects modelled
+- Complete data assumed (no missing responses)
+- 50-1000 simulations per power estimate (depending on mode)
+- Parallel processing using `r n_cores` cores
+
+## Computation Time
+
+```{r total-time}
+
+if (exists("global_start_time")) {
+  total_analysis_time <- difftime(Sys.time(), global_start_time, units = "mins")
+  if(show_diagnostics) {
+    cat(sprintf("Total execution time: %.1f minutes\n", total_analysis_time))
+    cat(sprintf("Mode: %s\n", ifelse(quick_mode, "Quick test", "Full analysis")))
+    cat(sprintf("Parallel processing: %s\n", ifelse(use_parallel, "Yes", "No")))
+    cat("=====================================\n")
+  }
+}
+```
+
+## Software Versions
+
+```{r session}
+sessionInfo()
+```
