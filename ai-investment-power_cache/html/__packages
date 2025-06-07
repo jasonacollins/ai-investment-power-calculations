@@ -11,7 +11,6 @@ lubridate
 Matrix
 lme4
 geepack
-gridExtra
 knitr
 kableExtra
 simr
